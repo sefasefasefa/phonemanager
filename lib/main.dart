@@ -1,7 +1,6 @@
+import 'dart:io';
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:web_socket_channel/io.dart';
 import 'package:audioplayers/audioplayers.dart';
 
 void main() {
@@ -16,7 +15,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(), // Terminal havası için dark tema
+      theme: ThemeData.dark(),
       home: const TunnelScreen(),
     );
   }
@@ -26,33 +25,31 @@ class TunnelScreen extends StatefulWidget {
   const TunnelScreen({super.key});
 
   @override
-  // ignore: library_private_types_in_public_api
   _TunnelScreenState createState() => _TunnelScreenState();
 }
 
 class _TunnelScreenState extends State<TunnelScreen> {
-  IOWebSocketChannel? _channel;
+  Socket? _socket;
   final AudioPlayer _audioPlayer = AudioPlayer();
 
   bool _isConnected = false;
   bool _isToggled = false;
-  String _log = "Tünel başlatılmaya hazır...\n";
+  String _log = "Ham TCP Tüneli başlatılmaya hazır...\n";
   Timer? _pingTimer;
 
-  // BURAYA KENDİ VDS IP ADRESİNİ VE PORTUNU YAZACAKSIN
-  final String _serverUrl = "ws://185.254.28.39:3001";
+  // VDS IP ve Ham TCP Portu (Sıfır Protokol Kısıtı)
+  final String _serverIp = "185.254.28.39";
+  final int _serverPort = 3001;
 
-  // Arka planı aldatmak için sessiz ses döngüsünü başlatır
-  // İnternetten 1 saniyelik tamamen sessiz bir mp3 linki verilmiştir
   void _startBackgroundAudio() async {
     try {
       await _audioPlayer.setReleaseMode(ReleaseMode.loop);
-      await _audioPlayer.setVolume(0.01); // Sesi tamamen kısığa yakın yapıyoruz
+      await _audioPlayer.setVolume(0.01);
       await _audioPlayer.play(
         UrlSource(
           'https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg',
         ),
-      ); // Örnek kaynak, buraya sessiz bir ses koyulmalı
+      );
       _writeLog("Arka plan koruma motoru (Audio) ateşlendi.");
     } catch (e) {
       _writeLog("Ses motoru hatası: $e");
@@ -64,43 +61,49 @@ class _TunnelScreenState extends State<TunnelScreen> {
     _writeLog("Arka plan koruma motoru durduruldu.");
   }
 
-  void _connectWebSocket() {
-    if (!_isToggled) return; // Kullanıcı tüneli kapattıysa zorla bağlanma
+  void _connectTcpSocket() async {
+    if (!_isToggled) return;
 
     try {
-      _writeLog("Sunucuya bağlanılıyor: $_serverUrl");
-      _channel = IOWebSocketChannel.connect(Uri.parse(_serverUrl));
+      _writeLog("TCP Sunucusuna bağlanılıyor: $_serverIp:$_serverPort");
+
+      _socket = await Socket.connect(
+        _serverIp,
+        _serverPort,
+        timeout: const Duration(seconds: 5),
+      );
 
       setState(() {
         _isConnected = true;
       });
-      _writeLog("Tünel açıldı! Operatör yuvarlama cezası engelleniyor.");
+      _writeLog(
+        "Ham TCP Tüneli açıldı! Operatör yuvarlama cezası engelleniyor.",
+      );
 
-      // Gelen Veri Akışını Dinleme
-      _channel!.stream.listen(
-        (message) {
-          _writeLog("Sunucudan Gelen Yanıt: $message");
+      // Gelen Ham Veri Akışını Dinleme (Yankı/Echo Takibi)
+      _socket!.listen(
+        (List<int> data) {
+          // Gelen ham veriyi stringe çevirip logluyoruz
+          final response = String.fromCharCodes(data).trim();
+          _writeLog("Sunucudan Gelen Yankı: $response");
         },
         onError: (error) {
-          _writeLog("Bağlantı hatası: $error");
+          _writeLog("Tünel hatası: $error");
           _handleDisconnect();
         },
         onDone: () {
           _writeLog("Bağlantı sunucu veya şebeke tarafından kapatıldı.");
           _handleDisconnect();
         },
+        cancelOnError: true,
       );
 
-      // Heartbeat: 30 Saniyede Bir Operatör Hattı Kapatmasın Diye Ping Gönder
+      // Tasarrufun Kalbi: Her 8 saniyede bir sadece 1 baytlık veri ('1') fırlat
       _pingTimer?.cancel();
-      _pingTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
-        if (_isConnected && _isToggled) {
-          final pingPayload = jsonEncode({
-            "type": "ping",
-            "timestamp": DateTime.now().millisecondsSinceEpoch,
-          });
-          _channel!.sink.add(pingPayload);
-          _writeLog("Canlılık sinyali (1 KB altı ping) gönderildi.");
+      _pingTimer = Timer.periodic(const Duration(seconds: 8), (timer) {
+        if (_isConnected && _isToggled && _socket != null) {
+          _socket!.write('1'); // Sadece 1 karakter = 1 Bayt
+          _writeLog("Mikro veri fırlatıldı (1 Bayt)");
         }
       });
     } catch (e) {
@@ -114,6 +117,8 @@ class _TunnelScreenState extends State<TunnelScreen> {
       _isConnected = false;
     });
     _pingTimer?.cancel();
+    _socket?.destroy();
+    _socket = null;
 
     if (_isToggled) {
       _writeLog(
@@ -121,21 +126,17 @@ class _TunnelScreenState extends State<TunnelScreen> {
       );
       Timer(const Duration(seconds: 5), () {
         if (_isToggled && !_isConnected) {
-          _connectWebSocket();
+          _connectTcpSocket();
         }
       });
     }
   }
 
-  // İstediğin an manuel olarak 1 KB altı veri gönderme fonksiyonu
+  // İstediğin an manuel olarak tüneli test etmek için 1 baytlık veri gönderme fonksiyonu
   void _sendMicroData() {
-    if (_isConnected && _channel != null) {
-      final data = jsonEncode({
-        "action": "data_stream",
-        "payload": "Hizli_Veri_Paketi",
-      });
-      _channel!.sink.add(data);
-      _writeLog("Mikro Veri Gönderildi: $data");
+    if (_isConnected && _socket != null) {
+      _socket!.write('1');
+      _writeLog("Manuel Mikro Veri Sıkıştırıldı (1 Bayt)");
     } else {
       _writeLog("Hata: Önce tüneli başlatmalısın.");
     }
@@ -153,7 +154,7 @@ class _TunnelScreenState extends State<TunnelScreen> {
   void dispose() {
     _pingTimer?.cancel();
     _audioPlayer.dispose();
-    _channel?.sink.close();
+    _socket?.destroy();
     super.dispose();
   }
 
@@ -202,7 +203,7 @@ class _TunnelScreenState extends State<TunnelScreen> {
                   border: Border.all(color: Colors.grey.shade800),
                 ),
                 child: SingleChildScrollView(
-                  reverse: true, // Log eklendikçe otomatik aşağı kaydırır
+                  reverse: true,
                   child: Text(
                     _log,
                     style: const TextStyle(
@@ -230,10 +231,10 @@ class _TunnelScreenState extends State<TunnelScreen> {
                       });
                       if (_isToggled) {
                         _startBackgroundAudio();
-                        _connectWebSocket();
+                        _connectTcpSocket();
                       } else {
                         _stopBackgroundAudio();
-                        _channel?.sink.close();
+                        _isToggled = false;
                         _handleDisconnect();
                         _writeLog("Kullanıcı tüneli durdurdu.");
                       }
